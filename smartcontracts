@@ -1,0 +1,284 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+// Interface for ERC20 token if needed for deposits (optional, can be integrated for enforcement)
+interface IERC20 {
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+// Main Roommate Matching Contract
+contract RoommateMatching {
+    // Struct for User Profile
+    struct Profile {
+        string name;              // User's name
+        uint256 age;              // Age
+        string gender;            // Gender (e.g., "Male", "Female", "Non-binary")
+        string major;             // Academic major
+        uint256 yearOfStudy;      // Year in university (1-4 for undergrad)
+        uint8 cleanliness;        // Cleanliness preference (1-5, 1=very messy, 5=very clean)
+        uint8 noiseLevel;         // Noise tolerance (1-5, 1=needs quiet, 5=ok with noise)
+        bool earlyRiser;          // True if early riser, false if night owl
+        bool smoker;              // Smoker or not
+        uint256 budget;           // Monthly budget for rent
+        string preferredLocation; // Preferred dorm or area
+        bool isActive;            // Whether the profile is active for matching
+        address userAddress;      // Ethereum address of the user
+    }
+
+    // Struct for Match Request
+    struct MatchRequest {
+        address requester;        // Who sent the request
+        address recipient;        // Who received the request
+        bool accepted;            // Whether accepted
+        bool declined;            // Whether declined
+        uint256 timestamp;        // Time of request
+    }
+
+    // Struct for Roommate Agreement
+    struct Agreement {
+        address[] parties;        // Addresses of roommates (2 or more)
+        string terms;             // JSON string or IPFS hash for agreement terms
+        uint256 depositAmount;    // Deposit per person (in wei or token)
+        bool active;              // Whether the agreement is active
+        mapping(address => bool) signatures; // Signatures from parties
+        uint256 startDate;        // Start date of agreement
+        uint256 endDate;          // End date of agreement
+        address tokenAddress;     // ERC20 token for deposits (optional, address(0) for native token)
+    }
+
+    // Mappings
+    mapping(address => Profile) public profiles;                    // User profiles
+    mapping(address => mapping(address => MatchRequest)) public matchRequests; // Requests from requester to recipient
+    mapping(uint256 => Agreement) public agreements;                // Agreements by ID
+    uint256 public agreementCounter;                                // Counter for agreement IDs
+
+    // Events
+    event ProfileCreated(address indexed user, string name);
+    event ProfileUpdated(address indexed user);
+    event MatchRequestSent(address indexed requester, address indexed recipient);
+    event MatchRequestAccepted(address indexed recipient, address indexed requester);
+    event MatchRequestDeclined(address indexed recipient, address indexed requester);
+    event AgreementCreated(uint256 indexed agreementId, address[] parties);
+    event AgreementSigned(uint256 indexed agreementId, address indexed signer);
+    event AgreementActivated(uint256 indexed agreementId);
+    event DepositPaid(uint256 indexed agreementId, address indexed payer, uint256 amount);
+    event DisputeRaised(uint256 indexed agreementId, address indexed raiser, string reason);
+
+    // Modifiers
+    modifier onlyRegistered() {
+        require(profiles[msg.sender].isActive, "User not registered or active");
+        _;
+    }
+
+    modifier validAgreement(uint256 agreementId) {
+        require(agreementId > 0 && agreementId <= agreementCounter, "Invalid agreement ID");
+        _;
+    }
+
+    // Function to register or update profile
+    function createOrUpdateProfile(
+        string memory _name,
+        uint256 _age,
+        string memory _gender,
+        string memory _major,
+        uint256 _yearOfStudy,
+        uint8 _cleanliness,
+        uint8 _noiseLevel,
+        bool _earlyRiser,
+        bool _smoker,
+        uint256 _budget,
+        string memory _preferredLocation
+    ) public {
+        require(_cleanliness >= 1 && _cleanliness <= 5, "Cleanliness must be 1-5");
+        require(_noiseLevel >= 1 && _noiseLevel <= 5, "Noise level must be 1-5");
+
+        profiles[msg.sender] = Profile({
+            name: _name,
+            age: _age,
+            gender: _gender,
+            major: _major,
+            yearOfStudy: _yearOfStudy,
+            cleanliness: _cleanliness,
+            noiseLevel: _noiseLevel,
+            earlyRiser: _earlyRiser,
+            smoker: _smoker,
+            budget: _budget,
+            preferredLocation: _preferredLocation,
+            isActive: true,
+            userAddress: msg.sender
+        });
+
+        if (bytes(_name).length == 0) { // If name was empty, it's a new creation
+            emit ProfileCreated(msg.sender, _name);
+        } else {
+            emit ProfileUpdated(msg.sender);
+        }
+    }
+
+    // Function to deactivate profile
+    function deactivateProfile() public onlyRegistered {
+        profiles[msg.sender].isActive = false;
+    }
+
+    // Function to compute compatibility score between two users (0-100, higher better)
+    function getCompatibilityScore(address userA, address userB) public view returns (uint8) {
+        Profile memory a = profiles[userA];
+        Profile memory b = profiles[userB];
+        require(a.isActive && b.isActive, "Both users must be active");
+
+        uint256 score = 100;
+
+        // Deduct based on differences
+        score -= abs(a.cleanliness, b.cleanliness) * 5; // Max deduct 20
+        score -= abs(a.noiseLevel, b.noiseLevel) * 5;    // Max deduct 20
+        if (a.earlyRiser != b.earlyRiser) score -= 15;
+        if (a.smoker != b.smoker) score -= 15;
+        if (a.budget > b.budget + 200 || b.budget > a.budget + 200) score -= 10; // Budget difference >200
+        if (keccak256(bytes(a.preferredLocation)) != keccak256(bytes(b.preferredLocation))) score -= 10;
+        if (a.yearOfStudy != b.yearOfStudy) score -= 5;
+        if (keccak256(bytes(a.gender)) != keccak256(bytes(b.gender))) score -= 5; // Optional, depending on preferences
+
+        return score > 100 ? 100 : uint8(score); // Cap at 100
+    }
+
+    // Helper function for absolute difference
+    function abs(uint8 a, uint8 b) internal pure returns (uint8) {
+        return a > b ? a - b : b - a;
+    }
+
+    // Function to send match request
+    function sendMatchRequest(address recipient) public onlyRegistered {
+        require(profiles[recipient].isActive, "Recipient not active");
+        require(recipient != msg.sender, "Cannot request yourself");
+        require(!matchRequests[msg.sender][recipient].accepted, "Already matched");
+
+        matchRequests[msg.sender][recipient] = MatchRequest({
+            requester: msg.sender,
+            recipient: recipient,
+            accepted: false,
+            declined: false,
+            timestamp: block.timestamp
+        });
+
+        emit MatchRequestSent(msg.sender, recipient);
+    }
+
+    // Function to accept match request
+    function acceptMatchRequest(address requester) public onlyRegistered {
+        MatchRequest storage req = matchRequests[requester][msg.sender];
+        require(req.requester == requester && !req.accepted && !req.declined, "Invalid request");
+
+        req.accepted = true;
+        emit MatchRequestAccepted(msg.sender, requester);
+    }
+
+    // Function to decline match request
+    function declineMatchRequest(address requester) public onlyRegistered {
+        MatchRequest storage req = matchRequests[requester][msg.sender];
+        require(req.requester == requester && !req.accepted && !req.declined, "Invalid request");
+
+        req.declined = true;
+        emit MatchRequestDeclined(msg.sender, requester);
+    }
+
+    // Function to create a roommate agreement (for 2 parties initially)
+    function createAgreement(
+        address[] memory _parties,
+        string memory _terms,
+        uint256 _depositAmount,
+        uint256 _startDate,
+        uint256 _endDate,
+        address _tokenAddress
+    ) public onlyRegistered returns (uint256) {
+        require(_parties.length >= 2, "At least 2 parties required");
+        for (uint i = 0; i < _parties.length; i++) {
+            require(profiles[_parties[i]].isActive, "All parties must be active");
+            require(_parties[i] != address(0), "Invalid address");
+        }
+
+        agreementCounter++;
+        Agreement storage agr = agreements[agreementCounter];
+        agr.parties = _parties;
+        agr.terms = _terms;
+        agr.depositAmount = _depositAmount;
+        agr.active = false;
+        agr.startDate = _startDate;
+        agr.endDate = _endDate;
+        agr.tokenAddress = _tokenAddress;
+
+        emit AgreementCreated(agreementCounter, _parties);
+        return agreementCounter;
+    }
+
+    // Function to sign agreement
+    function signAgreement(uint256 agreementId) public onlyRegistered validAgreement(agreementId) {
+        Agreement storage agr = agreements[agreementId];
+        bool isParty = false;
+        for (uint i = 0; i < agr.parties.length; i++) {
+            if (agr.parties[i] == msg.sender) {
+                isParty = true;
+                break;
+            }
+        }
+        require(isParty, "Not a party to this agreement");
+        require(!agr.signatures[msg.sender], "Already signed");
+
+        agr.signatures[msg.sender] = true;
+        emit AgreementSigned(agreementId, msg.sender);
+
+        // Check if all signed
+        bool allSigned = true;
+        for (uint i = 0; i < agr.parties.length; i++) {
+            if (!agr.signatures[agr.parties[i]]) {
+                allSigned = false;
+                break;
+            }
+        }
+        if (allSigned) {
+            agr.active = true;
+            emit AgreementActivated(agreementId);
+        }
+    }
+
+    // Function to pay deposit (enforcement)
+    function payDeposit(uint256 agreementId) public payable onlyRegistered validAgreement(agreementId) {
+        Agreement storage agr = agreements[agreementId];
+        require(agr.active, "Agreement not active");
+        require(agr.depositAmount > 0, "No deposit required");
+
+        uint256 amount = agr.depositAmount;
+        if (agr.tokenAddress == address(0)) {
+            // Native token (ETH)
+            require(msg.value == amount, "Incorrect deposit amount");
+            // Deposit held in contract
+        } else {
+            // ERC20 token
+            require(msg.value == 0, "Do not send native token for ERC20");
+            IERC20 token = IERC20(agr.tokenAddress);
+            require(token.transferFrom(msg.sender, address(this), amount), "Token transfer failed");
+        }
+
+        emit DepositPaid(agreementId, msg.sender, amount);
+    }
+
+    // Function to raise dispute (simple, can be extended with voting or oracle)
+    function raiseDispute(uint256 agreementId, string memory reason) public onlyRegistered validAgreement(agreementId) {
+        Agreement storage agr = agreements[agreementId];
+        bool isParty = false;
+        for (uint i = 0; i < agr.parties.length; i++) {
+            if (agr.parties[i] == msg.sender) {
+                isParty = true;
+                break;
+            }
+        }
+        require(isParty, "Not a party to this agreement");
+        require(agr.active, "Agreement not active");
+
+        emit DisputeRaised(agreementId, msg.sender, reason);
+        // Further logic can be added, e.g., pause agreement, notify admin
+    }
+
+    // Additional functions can be added for agreement termination, refund deposits, etc.
+    // For robustness, consider adding admin roles for university oversight in a private chain.
+}
